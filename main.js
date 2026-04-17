@@ -174,6 +174,14 @@ function formatDeadline(date, hour, minute) {
   return `${pad2(date.getDate())}.${pad2(date.getMonth() + 1)}.${date.getFullYear()} ${pad2(hour)}:${pad2(minute)}`;
 }
 
+/** Подпись к фото/документу в Telegram — максимум 1024 символа */
+const TELEGRAM_MAX_CAPTION = 1024;
+
+function truncateForCaption(text) {
+  if (text.length <= TELEGRAM_MAX_CAPTION) return text;
+  return `${text.slice(0, TELEGRAM_MAX_CAPTION - 1)}…`;
+}
+
 // --- START ---
 bot.start((ctx) => {
   ctx.reply("👋 Добро пожаловать!", mainMenu(hasAdminAccess(ctx)));
@@ -370,7 +378,9 @@ bot.on("text", async (ctx, next) => {
 });
 
 // SKIP FILE
-bot.command("skip", (ctx) => finalize(ctx, null));
+bot.command("skip", async (ctx) => {
+  await finalize(ctx, null);
+});
 bot.action("skip_file", async (ctx) => {
   if (ctx.session.state !== "file" || !ctx.session.task) {
     return ctx.answerCbQuery("Сейчас нечего пропускать");
@@ -379,60 +389,98 @@ bot.action("skip_file", async (ctx) => {
   return finalize(ctx, null);
 });
 
-// FILE
-bot.on(["document", "photo"], (ctx) => {
-  const fileId = ctx.message.document
-    ? ctx.message.document.file_id
-    : ctx.message.photo.pop().file_id;
+// FILE (document — sendDocument; снимок как «фото» — sendPhoto; иначе sendDocument с photo file_id падает)
+bot.on(["document", "photo"], async (ctx, next) => {
+  if (ctx.session?.state !== "file" || !ctx.session?.task) {
+    return next();
+  }
 
-  finalize(ctx, fileId);
+  let attachment;
+  if (ctx.message.document) {
+    attachment = { kind: "document", fileId: ctx.message.document.file_id };
+  } else if (ctx.message.photo?.length) {
+    const photos = ctx.message.photo;
+    attachment = { kind: "photo", fileId: photos[photos.length - 1].file_id };
+  } else {
+    return next();
+  }
+
+  await finalize(ctx, attachment);
 });
 
 // FINALIZE
-async function finalize(ctx, fileId) {
-  const data = ctx.session.task;
-  const userIds = data.users.map((id) => Number(id));
-  const usersById = new Map();
-
-  if (data.isCommon && userIds.length) {
-    const { rows: userRows } = await db.query(
-      "SELECT id, name FROM users WHERE id = ANY($1::bigint[])",
-      [userIds]
-    );
-    userRows.forEach((u) => usersById.set(Number(u.id), u.name));
+/** @param {null | { kind: "document" | "photo"; fileId: string }} attachment */
+async function finalize(ctx, attachment) {
+  const data = ctx.session?.task;
+  if (!data || !Array.isArray(data.users) || !data.users.length) {
+    await ctx.reply("Сессия задачи не найдена. Начните выдачу заново.").catch(() => {});
+    return;
   }
 
-  for (const uid of data.users) {
-    const numericUid = Number(uid);
-    const result = await db.query(
-      "INSERT INTO tasks (user_id, task_text, priority, deadline) VALUES ($1, $2, $3, $4) RETURNING id",
-      [numericUid, data.text, data.priority, data.deadline]
-    );
-    const taskId = result.rows[0].id;
-    let text = `🔔 Новая задача\n\n📝 ${data.text}\nПриоритет: ${data.priority}\n📅 ${data.deadline}`;
+  const fileId = attachment && attachment.fileId;
+  const fileKind = attachment && attachment.kind;
 
-    if (data.isCommon) {
-      const teammateNames = userIds
-        .filter((id) => id !== numericUid)
-        .map((id) => usersById.get(id) || `ID ${id}`);
+  try {
+    const userIds = data.users.map((id) => Number(id));
+    const usersById = new Map();
 
-      text += teammateNames.length
-        ? `\n\n👥 Выполняете вместе с: ${teammateNames.join(", ")}`
-        : "\n\n👥 Общая задача";
+    if (data.isCommon && userIds.length) {
+      const { rows: userRows } = await db.query(
+        "SELECT id, name FROM users WHERE id = ANY($1::bigint[])",
+        [userIds]
+      );
+      userRows.forEach((u) => usersById.set(Number(u.id), u.name));
     }
 
-    if (fileId) {
-      await bot.telegram.sendDocument(numericUid, fileId, {
-        caption: text,
-        ...taskButtons(taskId)
-      });
-    } else {
-      await bot.telegram.sendMessage(numericUid, text, taskButtons(taskId));
+    for (const uid of data.users) {
+      const numericUid = Number(uid);
+      const result = await db.query(
+        "INSERT INTO tasks (user_id, task_text, priority, deadline) VALUES ($1, $2, $3, $4) RETURNING id",
+        [numericUid, data.text, data.priority, data.deadline]
+      );
+      const taskId = result.rows[0].id;
+      let text = `🔔 Новая задача\n\n📝 ${data.text}\nПриоритет: ${data.priority}\n📅 ${data.deadline}`;
+
+      if (data.isCommon) {
+        const teammateNames = userIds
+          .filter((id) => id !== numericUid)
+          .map((id) => usersById.get(id) || `ID ${id}`);
+
+        text += teammateNames.length
+          ? `\n\n👥 Выполняете вместе с: ${teammateNames.join(", ")}`
+          : "\n\n👥 Общая задача";
+      }
+
+      const extra = taskButtons(taskId);
+
+      if (fileId) {
+        const caption = truncateForCaption(text);
+        if (fileKind === "photo") {
+          await bot.telegram.sendPhoto(numericUid, fileId, {
+            caption,
+            ...extra
+          });
+        } else {
+          await bot.telegram.sendDocument(numericUid, fileId, {
+            caption,
+            ...extra
+          });
+        }
+      } else {
+        await bot.telegram.sendMessage(numericUid, text, extra);
+      }
     }
+
+    await ctx.reply("✅ Задача выдана!");
+    ctx.session = {};
+  } catch (err) {
+    console.error("finalize failed:", err);
+    await ctx
+      .reply(
+        "Не удалось отправить задачу (часто: сотрудник не нажимал /start у бота, или слишком длинный текст для подписи к файлу — до 1024 символов). Попробуйте ещё раз или без вложения."
+      )
+      .catch(() => {});
   }
-
-  await ctx.reply("✅ Задача выдана!");
-  ctx.session = {};
 }
 
 // DONE
