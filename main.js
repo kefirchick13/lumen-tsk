@@ -1,6 +1,6 @@
 const { Telegraf, Markup, session } = require("telegraf");
 const { Pool } = require("pg");
-require("dotenv").config();
+const { getDbPoolConfig } = require("./db-config");
 
 const API_TOKEN = process.env.API_TOKEN;
 const ADMIN_ID = Number(process.env.ADMIN_ID);
@@ -20,16 +20,7 @@ bot.use((ctx, next) => {
 });
 
 // --- DB ---
-const dbConfig = process.env.DATABASE_URL
-  ? { connectionString: process.env.DATABASE_URL }
-  : {
-      host: process.env.PGHOST || "127.0.0.1",
-      port: Number(process.env.PGPORT || 5432),
-      user: process.env.PGUSER || "ilaskaseev",
-      database: process.env.PGDATABASE || "taskbot"
-    };
-
-const db = new Pool(dbConfig);
+const db = new Pool(getDbPoolConfig());
 
 async function checkDbConnection() {
   await db.query("SELECT 1");
@@ -446,21 +437,52 @@ async function finalize(ctx, fileId) {
 // DONE
 bot.action(/done_(\d+)/, async (ctx) => {
   const id = ctx.match[1];
+  const userId = ctx.from.id;
   try {
-    // Delete with RETURNING to avoid race conditions on repeated taps.
+    // Только своя задача; RETURNING — защита от повторного нажатия.
     const { rows } = await db.query(
-      "DELETE FROM tasks WHERE id = $1 RETURNING task_text",
-      [id]
+      `DELETE FROM tasks
+       WHERE id = $1 AND user_id = $2
+       RETURNING id, user_id, task_text, priority, deadline`,
+      [id, userId]
     );
 
     if (!rows[0]) {
-      await ctx.answerCbQuery("Задача уже закрыта");
+      await ctx.answerCbQuery("Задача недоступна или уже закрыта");
       return;
     }
 
+    const task = rows[0];
+
+    const { rows: nameRows } = await db.query("SELECT name FROM users WHERE id = $1", [
+      userId
+    ]);
+    const from = ctx.from;
+    const displayName =
+      nameRows[0]?.name ||
+      [from.first_name, from.last_name].filter(Boolean).join(" ").trim() ||
+      `ID ${userId}`;
+
+    const { rows: countRows } = await db.query(
+      "SELECT COUNT(*)::int AS n FROM tasks WHERE user_id = $1",
+      [userId]
+    );
+    const remaining = countRows[0].n;
+
     await bot.telegram.sendMessage(
       ADMIN_ID,
-      `✅ Задача выполнена\n📝 ${rows[0].task_text}`
+      [
+        "✅ Сотрудник закрыл задачу",
+        "",
+        `👤 Кто закрыл: ${displayName}`,
+        `🪪 Telegram ID: ${userId}`,
+        `🆔 Задача #${task.id}`,
+        `📝 Текст: ${task.task_text}`,
+        `🔖 Приоритет: ${task.priority}`,
+        `📅 Дедлайн: ${task.deadline}`,
+        "",
+        `📋 Осталось активных задач у сотрудника: ${remaining}`
+      ].join("\n")
     );
 
     const hasTextMessage = Boolean(ctx.callbackQuery?.message?.text);
@@ -471,7 +493,6 @@ bot.action(/done_(\d+)/, async (ctx) => {
     }
     await ctx.answerCbQuery("Отмечено");
   } catch (err) {
-    // Fallback so employee always sees confirmation.
     await ctx.answerCbQuery("Отмечено");
     await ctx.reply("✅ Выполнено");
     console.error("Failed to finish task:", err);

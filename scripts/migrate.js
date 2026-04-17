@@ -1,20 +1,12 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { Pool } = require("pg");
-require("dotenv").config();
+const { getDbPoolConfig } = require("../db-config");
 
 const migrationsDir = path.join(__dirname, "..", "migrations");
-const dbConfig = process.env.DATABASE_URL
-  ? { connectionString: process.env.DATABASE_URL }
-  : {
-      host: process.env.PGHOST || "127.0.0.1",
-      port: Number(process.env.PGPORT || 5432),
-      user: process.env.PGUSER || "ilaskaseev",
-      database: process.env.PGDATABASE || "taskbot"
-    };
 
 async function main() {
-  const db = new Pool(dbConfig);
+  const db = new Pool(getDbPoolConfig());
 
   await db.query(`
     CREATE TABLE IF NOT EXISTS schema_migrations (

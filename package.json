@@ -6,8 +6,6 @@
     "scripts": {
     "start": "node main.js",
     "dev": "nodemon main.js",
-    "db:start": "node scripts/db-start.js",
-    "db:stop": "node scripts/db-stop.js",
     "migrate": "node scripts/migrate.js"
   },
     "dependencies": {
