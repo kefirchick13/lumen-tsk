@@ -1,0 +1,12 @@
+CREATE TABLE IF NOT EXISTS users (
+  id BIGINT PRIMARY KEY,
+  name TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT NOT NULL,
+  task_text TEXT NOT NULL,
+  priority TEXT NOT NULL,
+  deadline TEXT NOT NULL
+);
