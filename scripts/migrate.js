@@ -5,9 +5,11 @@ const { getDbPoolConfig } = require("../db-config");
 
 const migrationsDir = path.join(__dirname, "..", "migrations");
 
-async function main() {
-  const db = new Pool(getDbPoolConfig());
-
+/**
+ * Применяет все непройденные *.sql из migrations/ к переданному пулу.
+ * Используется и CLI (`node scripts/migrate.js`), и при старте бота.
+ */
+async function runMigrations(db) {
   await db.query(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       id TEXT PRIMARY KEY,
@@ -38,12 +40,23 @@ async function main() {
       throw err;
     }
   }
-
-  await db.end();
-  console.log("Migrations completed.");
 }
 
-main().catch((err) => {
-  console.error("Migration failed:", err);
-  process.exit(1);
-});
+async function main() {
+  const db = new Pool(getDbPoolConfig());
+  try {
+    await runMigrations(db);
+    console.log("Migrations completed.");
+  } finally {
+    await db.end();
+  }
+}
+
+module.exports = { runMigrations };
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("Migration failed:", err);
+    process.exit(1);
+  });
+}

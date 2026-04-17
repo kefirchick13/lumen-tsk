@@ -1,6 +1,7 @@
 const { Telegraf, Markup, session } = require("telegraf");
 const { Pool } = require("pg");
 const { getDbPoolConfig } = require("./db-config");
+const { runMigrations } = require("./scripts/migrate");
 
 const API_TOKEN = process.env.API_TOKEN;
 const ADMIN_ID = Number(process.env.ADMIN_ID);
@@ -31,7 +32,7 @@ function mainMenu(isAdmin) {
   let buttons = [["📋 Мои задачи"]];
   if (isAdmin) {
     buttons.push(["⚙️ Админ-панель"]);
-    buttons.push(["📊 Все задачи"]);
+    buttons.push(["📊 Все задачи", "👥 Все сотрудники"]);
   }
   return Markup.keyboard(buttons).resize();
 }
@@ -532,9 +533,109 @@ bot.hears("📊 Все задачи", async (ctx) => {
   return ctx.reply(text);
 });
 
-checkDbConnection()
-  .then(() => bot.launch())
-  .catch((err) => {
-    console.error("Failed to init PostgreSQL:", err);
-    process.exit(1);
+// --- ALL STAFF (admin) ---
+bot.hears("👥 Все сотрудники", async (ctx) => {
+  if (!hasAdminAccess(ctx)) return;
+
+  const { rows } = await db.query("SELECT id, name FROM users ORDER BY name");
+  if (!rows.length) return ctx.reply("Нет сотрудников.");
+
+  const keyboard = rows.map((u) => {
+    const label = `${u.name} · ${u.id}`.slice(0, 64);
+    return [Markup.button.callback(label, `stf_pick_${u.id}`)];
   });
+
+  return ctx.reply("Выберите сотрудника:", Markup.inlineKeyboard(keyboard));
+});
+
+bot.action(/^stf_pick_(\d+)$/, async (ctx) => {
+  if (!hasAdminAccess(ctx)) {
+    return ctx.answerCbQuery("Нет доступа");
+  }
+  const uid = ctx.match[1];
+  const { rows } = await db.query("SELECT name FROM users WHERE id = $1", [uid]);
+  if (!rows[0]) {
+    return ctx.answerCbQuery("Сотрудник не найден");
+  }
+  await ctx.answerCbQuery();
+  const name = rows[0].name;
+  return ctx.reply(
+    `👤 ${name}\n🪪 ID: ${uid}\n\nВыберите действие:`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback("📋 Дать задачу", `stf_give_${uid}`)],
+      [Markup.button.callback("🗑 Удалить сотрудника", `stf_del_${uid}`)],
+      [Markup.button.callback("📑 Задачи сотрудника", `stf_view_${uid}`)]
+    ])
+  );
+});
+
+bot.action(/^stf_give_(\d+)$/, async (ctx) => {
+  if (!hasAdminAccess(ctx)) {
+    return ctx.answerCbQuery("Нет доступа");
+  }
+  const uid = ctx.match[1];
+  const { rows } = await db.query("SELECT 1 FROM users WHERE id = $1", [uid]);
+  if (!rows.length) {
+    return ctx.answerCbQuery("Сотрудник не найден");
+  }
+  await ctx.answerCbQuery();
+  ctx.session.task = { users: [uid], isCommon: false };
+  return askPriority(ctx);
+});
+
+bot.action(/^stf_del_(\d+)$/, async (ctx) => {
+  if (!hasAdminAccess(ctx)) {
+    return ctx.answerCbQuery("Нет доступа");
+  }
+  const uid = ctx.match[1];
+  await ctx.answerCbQuery();
+  await db.query("DELETE FROM tasks WHERE user_id = $1", [uid]);
+  const { rows } = await db.query(
+    "DELETE FROM users WHERE id = $1 RETURNING name",
+    [uid]
+  );
+  if (!rows[0]) {
+    return ctx.reply("Сотрудник не найден.");
+  }
+  return ctx.reply(
+    `Сотрудник «${rows[0].name}» удалён, все его задачи удалены.`
+  );
+});
+
+bot.action(/^stf_view_(\d+)$/, async (ctx) => {
+  if (!hasAdminAccess(ctx)) {
+    return ctx.answerCbQuery("Нет доступа");
+  }
+  const uid = ctx.match[1];
+  await ctx.answerCbQuery();
+  const { rows: users } = await db.query("SELECT name FROM users WHERE id = $1", [uid]);
+  if (!users[0]) {
+    return ctx.reply("Сотрудник не найден.");
+  }
+  const { rows: tasks } = await db.query(
+    "SELECT * FROM tasks WHERE user_id = $1 ORDER BY id DESC",
+    [uid]
+  );
+  if (!tasks.length) {
+    return ctx.reply(`У «${users[0].name}» нет задач.`);
+  }
+  let text = `📑 Задачи: ${users[0].name} (ID ${uid})\n\n`;
+  tasks.forEach((t) => {
+    text += `🆔 #${t.id}\n📝 ${t.task_text}\n${t.priority}\n📅 ${t.deadline}\n\n`;
+  });
+  if (text.length > 4000) {
+    text = `${text.slice(0, 3997)}…`;
+  }
+  return ctx.reply(text);
+});
+
+async function start() {
+  await runMigrations(db);
+  await checkDbConnection();
+  await bot.launch();
+}
+
+start().catch((err) => {
+  console.error("Failed to start bot:", err);
+  process.exit(1);
+});
