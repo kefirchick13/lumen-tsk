@@ -45,8 +45,149 @@ function adminInline() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("➕ Добавить сотрудника", "add_user")],
     [Markup.button.callback("👤 Выдать задачу", "single_task")],
-    [Markup.button.callback("👥 Общая задача", "common_task")]
+    [Markup.button.callback("👥 Общая задача", "common_task")],
+    [Markup.button.callback("📣 Рассылка по задачам", "broadcast_tasks")]
   ]);
+}
+
+const DAILY_DIGEST_HOUR = Number(process.env.DAILY_DIGEST_HOUR || "9");
+const DAILY_DIGEST_TZ = process.env.DAILY_DIGEST_TZ || "Europe/Moscow";
+
+/** @type {string | null} */
+let lastDailyDigestDayKey = null;
+
+function wallClockInTz(timeZone) {
+  const dtf = new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  });
+  const parts = Object.fromEntries(
+    dtf
+      .formatToParts(new Date())
+      .filter((p) => p.type !== "literal")
+      .map((p) => [p.type, p.value])
+  );
+  return {
+    hour: Number(parts.hour),
+    minute: Number(parts.minute),
+    dayKey: `${parts.year}-${parts.month}-${parts.day}`
+  };
+}
+
+/** Склонение «N активн… задач…» для русского */
+function ruActiveTasksPhrase(n) {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod100 >= 11 && mod100 <= 14) {
+    return `${n} активных задач`;
+  }
+  if (mod10 === 1) {
+    return `${n} активная задача`;
+  }
+  if (mod10 >= 2 && mod10 <= 4) {
+    return `${n} активные задачи`;
+  }
+  return `${n} активных задач`;
+}
+
+function buildTaskDigestMessage(displayName, taskCount) {
+  const greeting = displayName ? `${displayName}, здравствуйте!` : "Здравствуйте!";
+  if (taskCount > 0) {
+    return [
+      `📋 ${greeting}`,
+      "",
+      `Сейчас у вас ${ruActiveTasksPhrase(taskCount)}.`,
+      "Закройте выполненные кнопкой «✅ Закрыть» у каждой задачи — так список остаётся актуальным для всех.",
+      "",
+      "Открыть список: кнопка «📋 Мои задачи»."
+    ].join("\n");
+  }
+  return [
+    `✨ ${greeting}`,
+    "",
+    "Открытых задач нет — отличная работа! Можно спокойно переключиться на следующее или немного передохнуть. Так держать!"
+  ].join("\n");
+}
+
+/**
+ * Рассылка напоминаний по актуальным задачам всем из таблицы users.
+ * @param {{ logLabel?: string }} [opts]
+ * @returns {Promise<{ ok: number; fail: number; total: number }>}
+ */
+async function sendTaskDigestToAllUsers(opts = {}) {
+  const logLabel = opts.logLabel || "task_digest";
+  const { rows } = await db.query(
+    `SELECT u.id, u.name, COUNT(t.id)::int AS task_count
+     FROM users u
+     LEFT JOIN tasks t ON t.user_id = u.id
+     GROUP BY u.id, u.name
+     ORDER BY u.name`
+  );
+
+  let ok = 0;
+  let fail = 0;
+
+  for (const row of rows) {
+    const uid = Number(row.id);
+    const name = row.name && String(row.name).trim();
+    const text = buildTaskDigestMessage(name || "", row.task_count);
+    try {
+      await bot.telegram.sendMessage(uid, text);
+      ok += 1;
+    } catch (err) {
+      fail += 1;
+      console.error(`[${logLabel}] sendMessage failed for ${uid}:`, err?.message || err);
+    }
+    await new Promise((r) => setTimeout(r, 55));
+  }
+
+  return { ok, fail, total: rows.length };
+}
+
+function startDailyTaskDigestScheduler() {
+  if (Number.isNaN(DAILY_DIGEST_HOUR) || DAILY_DIGEST_HOUR < 0 || DAILY_DIGEST_HOUR > 23) {
+    console.warn(
+      "DAILY_DIGEST_HOUR is invalid; daily digest disabled. Set DAILY_DIGEST_HOUR to 0–23."
+    );
+    return;
+  }
+
+  setInterval(async () => {
+    let clock;
+    try {
+      clock = wallClockInTz(DAILY_DIGEST_TZ);
+    } catch (err) {
+      console.error("Daily digest: invalid DAILY_DIGEST_TZ, falling back to local time:", err);
+      const now = new Date();
+      clock = {
+        hour: now.getHours(),
+        minute: now.getMinutes(),
+        dayKey: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`
+      };
+    }
+
+    if (clock.minute !== 0 || clock.hour !== DAILY_DIGEST_HOUR) {
+      return;
+    }
+    if (lastDailyDigestDayKey === clock.dayKey) {
+      return;
+    }
+
+    lastDailyDigestDayKey = clock.dayKey;
+    try {
+      const { ok, fail, total } = await sendTaskDigestToAllUsers({ logLabel: "daily_digest" });
+      console.log(
+        `Daily task digest (${clock.dayKey} ${DAILY_DIGEST_TZ}): sent ${ok}/${total}, failed ${fail}`
+      );
+    } catch (err) {
+      console.error("Daily task digest failed:", err);
+    }
+  }, 60_000);
 }
 
 function taskButtons(id) {
@@ -198,6 +339,24 @@ async function requestAdminAccess(ctx) {
 
 bot.command("admin", requestAdminAccess);
 bot.hears("⚙️ Админ-панель", requestAdminAccess);
+
+bot.action("broadcast_tasks", async (ctx) => {
+  if (!hasAdminAccess(ctx)) {
+    return ctx.answerCbQuery("Нет доступа");
+  }
+  await ctx.answerCbQuery("Рассылаю…");
+  try {
+    const { ok, fail, total } = await sendTaskDigestToAllUsers({ logLabel: "admin_broadcast" });
+    await ctx.reply(
+      total === 0
+        ? "В базе нет сотрудников — рассылать некому."
+        : `Рассылка завершена.\n\nОтправлено: ${ok}\nОшибок: ${fail}\nВсего в списке: ${total}`
+    );
+  } catch (err) {
+    console.error("broadcast_tasks failed:", err);
+    await ctx.reply("Не удалось выполнить рассылку. Подробности в логе сервера.");
+  }
+});
 
 bot.on("text", async (ctx, next) => {
   if (ctx.session.state === "password") {
@@ -680,6 +839,7 @@ bot.action(/^stf_view_(\d+)$/, async (ctx) => {
 async function start() {
   await runMigrations(db);
   await checkDbConnection();
+  startDailyTaskDigestScheduler();
   await bot.launch();
 }
 
